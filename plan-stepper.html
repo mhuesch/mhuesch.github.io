@@ -1,0 +1,581 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PLAN stepper</title></head><body><script>
+// stepper.js: the PLAN stepper page (E1, a first stab; notes/explainer-vision.md). It runs the rules of the 2024 spec
+// (plunder/doc/plan/PLAN_SPEC.txt) one at a time on a few small expressions, and lights up the spec line that fired.
+// The explain cog serves it (explain/cog.sire); mkreplay.py turns it into explain/stepperjs.sire, so the rules of that tool
+// apply: ASCII only, no backslashes, comments on their own lines, top-level statements at column 0.
+// The stdlib laws are transcribed by hand from plan-di-c/sire/00_boot.sire (their compiled shape, as the REPL prints
+// them). Later: take them from the ship itself, and step in Sire instead of here.
+
+var LB = String.fromCharCode(123);
+var RB = String.fromCharCode(125);
+var LE = String.fromCharCode(8804);
+
+var SPEC = [
+"Every PLAN vaue is either a pin x:<i>, a law x:{n a b}, an app x:(f g),",
+"a nat x:@, or a black hole x:<>.",
+"",
+"(o <- x) mutates o in place, updating it's value to equal x.",
+"",
+"Unmatched patterns diverge.",
+"",
+"Run F[x] to normalize a value.",
+"",
+"N[o] =                             | N[o] = E[o]; if o:@ then o else 0",
+"    E[o]                           |",
+"    when o:(f x)                   | I[f, (e x), 0] = x",
+"         F[f]; F[x]                | I[f, e,     0] = e",
+"    o                              | I[f, (e x), n] = I[f, e, n-1]",
+"                                   | I[f, e,     n] = f",
+"E[o] =                             |",
+"    when o:(f x)                   | A[(f x)]     = A[f]-1",
+"        E[f]                       | A[<n:@>]     = I[1, (6 1 3 1), n]",
+"        when A[f]=1                | A[<p>]       = A[p]",
+"            o <- S[o]              | A[{n a b}]   = a",
+"            o <- X[o,o]            | A[n:@]       = 0",
+"            E[o]                   |",
+"    o                              | X[(f x), e]           = X[f,e]",
+"                                   | X[0, (_ x)]           = <F[x]>",
+"I[f, (e x), 0] = x                 | X[1, (_ n a b)]       = W[N[n],N[a],F[b]]",
+"I[f, e,     0] = e                 | X[2, (_ x)]           = N[x]+1",
+"I[f, (e x), n] = I[f, e, n-1]      | X[4, (_ p l a z m x)] = C[p,l,a,z,m,E[x]]",
+"I[f, e,     n] = f                 | X[{n a b}, e]         = B[a,a,e,b,b]",
+"                                   | X[<p>, e]             = X[p,e]",
+"C[p,_,_,_,_,<i>]     = (p i)       |",
+"C[_,l,_,_,_,{n a b}] = (l n a b)   | R[n,e,b:@] | b<=n = I[_,e,(n-b)]",
+"C[_,_,a,_,_,(f x)]   = (a f x)     | R[n,e,(0 f x)]   = (R[n,e,f] R[n,e,x])",
+"C[_,_,_,z,_,0]       = z           | R[n,e,(0 x)]     = x",
+"C[_,_,_,_,m,x:@]     = (m (x-1))   | R[n,e,x]         = x",
+"                                   |",
+"W[n,a,b] | n>0 = {n,a,b}           | L[i,n,e,(1 v b)] =",
+"                                   |     I[_,e,i] <- R[n,e,v]",
+"S[o:(f x y)]       = (S[(f x)] y)  |     L[i+1,n,e,b]",
+"S[o:(<{n a b}> y)] = o             | L[_,n,e,x] = R[n,e,x]",
+"S[o:(<@> y)]       = o             |",
+"S[o:(<f> x)]       = S[(f x)]      | B[a,n,e,b,(1 _ k)] = B[a,n+1,(e <>),b,k]",
+"S[o]               = o             | B[a,n,e,b,x]       = L[a,n,e,b]"
+].map(function (s) { return s.split("<=").join(LE); });
+
+// The spec lines each rule lights: [line number (1-based), side] where side is 0 (left) or 1 (right).
+var RULES = {
+  F: [[12, 0], [13, 0]],
+  N: [[10, 1]],
+  E: [[16, 0], [17, 0]],
+  Ef: [[18, 0]],
+  sat: [[19, 0]],
+  Aapp: [[17, 1]],
+  Aprim: [[18, 1]],
+  Apin: [[19, 1]],
+  Alaw: [[20, 1]],
+  Anat: [[21, 1]],
+  S: [[20, 0], [38, 0], [41, 0]],
+  X: [[21, 0], [23, 1]],
+  Xpin: [[29, 1]],
+  X0: [[24, 1]],
+  X1: [[25, 1], [36, 0]],
+  X2: [[26, 1]],
+  X3: [[27, 1]],
+  C0: [[30, 0]],
+  C1: [[31, 0]],
+  C2: [[32, 0]],
+  C3: [[33, 0]],
+  C4: [[34, 0]],
+  Xlaw: [[28, 1]],
+  B: [[41, 1], [42, 1]],
+  L: [[36, 1], [37, 1], [38, 1]],
+  R: [[39, 1], [31, 1], [32, 1], [33, 1], [34, 1]],
+  again: [[22, 0]],
+  done: [[23, 0]]
+};
+
+// ---- Values. Each is a cell with an id; (o <- x) overwrites the cell in place, so every reference to it sees the new value.
+
+var NEXT = 0;
+
+function mk(t, p) {
+  var o = { t: t, id: ++NEXT };
+  for (var k in p) { o[k] = p[k]; }
+  return o;
+}
+
+function nat(n) { return mk("nat", { n: BigInt(n) }); }
+
+function pin(v) { return mk("pin", { v: v }); }
+
+function app(f, x) { return mk("app", { f: f, x: x }); }
+
+function hole() { return mk("hole", {}); }
+
+function strNat(s) {
+  var n = 0n;
+  for (var i = s.length - 1; i >= 0; i--) { n = n * 256n + BigInt(s.charCodeAt(i)); }
+  return n;
+}
+
+function natStr(n) {
+  var s = "";
+  while (n > 0n) {
+    var c = Number(n % 256n);
+    if (c < 33 || c > 126) { return null; }
+    s += String.fromCharCode(c);
+    n = n / 256n;
+  }
+  return s;
+}
+
+function law(name, a, b) { return mk("law", { nm: typeof name === "string" ? strNat(name) : BigInt(name), a: BigInt(a), b: b }); }
+
+function set(o, x) {
+  if (o === x) { return; }
+  ["n", "v", "nm", "a", "b", "f", "x"].forEach(function (k) { delete o[k]; });
+  o.t = x.t;
+  ["n", "v", "nm", "a", "b", "f", "x"].forEach(function (k) { if (k in x) { o[k] = x[k]; } });
+}
+
+function Diverge(msg) { this.msg = msg; }
+
+// ---- Building law bodies from a small tree: ["ref", i], ["lit", v], ["ap", f, x, ...], ["let", v, k].
+
+function countLets(t) { return t[0] === "let" ? 1 + countLets(t[2]) : 0; }
+
+function compile(t, n) {
+  if (t[0] === "ref") { return nat(t[1]); }
+  if (t[0] === "lit") {
+    var v = t[1];
+    if ((v.t === "nat" && v.n <= BigInt(n)) || v.t === "app") { return app(nat(0), v); }
+    return v;
+  }
+  if (t[0] === "ap") {
+    var acc = compile(t[1], n);
+    for (var i = 2; i < t.length; i++) { acc = app(app(nat(0), acc), compile(t[i], n)); }
+    return acc;
+  }
+  if (t[0] === "let") { return app(app(nat(1), compile(t[1], n)), compile(t[2], n)); }
+  return t;
+}
+
+function ref(i) { return ["ref", i]; }
+
+function lit(v) { return ["lit", v]; }
+
+function ap() { return ["ap"].concat(Array.prototype.slice.call(arguments).map(function (x) { return Array.isArray(x) ? x : lit(x); })); }
+
+function mkLaw(name, a, tree) { return law(name, a, compile(tree, a + countLets(tree))); }
+
+// The stdlib, fresh for every run (evaluation mutates cells). LABELS names pins and laws for the "names" view.
+var LABELS = new Map();
+
+function stdlib() {
+  LABELS = new Map();
+  var S = {};
+  var lab = function (o, s) { LABELS.set(o, s); return o; };
+  S.Pin = lab(pin(nat(0)), "Pin");
+  S.Law = lab(pin(nat(1)), "Law");
+  S.Inc = lab(pin(nat(2)), "Inc");
+  S.Case = lab(pin(nat(3)), "Case");
+  S.Die = lab(pin(nat(9)), "Die");
+  var k2 = lab(law(0, 2, nat(1)), "z&_");
+  var k3 = lab(law(0, 3, nat(1)), "z&(_ _)");
+  var k4 = lab(law(0, 4, nat(1)), "z&(_ _ _)");
+  var id = lab(law(0, 1, nat(1)), "i&i");
+  S.NatCase = lab(pin(mkLaw("NatCase", 3, ap(S.Case, ap(k2, ref(1)), ap(k4, ref(1)), ap(k3, ref(1)), ref(1), ref(2), ref(3)))), "NatCase");
+  S.Times = lab(pin(mkLaw("Times", 3, ap(S.NatCase, ref(2), ap(ref(0), ref(1), ap(ref(1), ref(2))), ref(3)))), "Times");
+  S.Nat = lab(pin(mkLaw("Nat", 1, ap(S.NatCase, nat(0), S.Inc, ref(1)))), "Nat");
+  S.Dec = lab(pin(mkLaw("Dec", 1, ap(S.NatCase, nat(0), id, ref(1)))), "Dec");
+  S.Add = lab(pin(mkLaw("Add", 2, ap(S.Times, S.Inc, ap(S.Nat, ref(1)), ref(2)))), "Add");
+  S.Mul = lab(pin(mkLaw("Mul", 2, ap(S.Times, ap(S.Add, ref(1)), nat(0), ref(2)))), "Mul");
+  S.K = lab(pin(mkLaw("K", 2, ref(1))), "K");
+  S.Quad = lab(pin(mkLaw("Quad", 1, ["let", ap(S.Add, ref(1), ref(1)), ap(S.Add, ref(2), ref(2))])), "Quad");
+  return S;
+}
+
+function apps(f) {
+  var o = f;
+  for (var i = 1; i < arguments.length; i++) { o = app(o, arguments[i]); }
+  return o;
+}
+
+var EXAMPLES = (function () { return [
+  { title: "Inc 41", want: 42n, sire: "(Inc 41)", blurb: "The simplest call: Inc is primitive number 2, written <2>. It needs one argument, it has one, so it runs.",
+    make: function (S) { return apps(S.Inc, nat(41)); } },
+  { title: "K 7 (Die 0)", want: 7n, sire: "(K 7 (Die 0))", blurb: "Laziness. K returns its first argument. The second would crash if anyone looked at it, and nobody does.",
+    make: function (S) { return apps(S.K, nat(7), apps(S.Die, nat(0))); } },
+  { title: "Law %id 1 1 5", want: 5n, sire: "(Law %id 1 1 5)", blurb: "Make a function at run time, then call it: primitive 1 builds a law named id with one argument whose body is 1 (the argument).",
+    make: function (S) { return apps(S.Law, nat(strNat("id")), nat(1), nat(1), nat(5)); } },
+  { title: "Add 2 3", want: 5n, sire: "(Add 2 3)", blurb: "Addition is not built in. Add is a law: apply Inc to 2, three times, by counting 3 down to 0 with Case.",
+    make: function (S) { return apps(S.Add, nat(2), nat(3)); } },
+  { title: "Quad 1", want: 4n, sire: "(Quad 1)", blurb: "Sharing. Quad x = let y = Add x x in Add y y. y is one cell, used twice: it is worked out once and both uses see the result.",
+    make: function (S) { return apps(S.Quad, nat(1)); } },
+  { title: "Mul 2 3", want: 6n, sire: "(Mul 2 3)", blurb: "A longer one. Mul is Times (Add 2) 0 3: add 2, three times, starting from 0. Use Over and Out to skip the details.",
+    make: function (S) { return apps(S.Mul, nat(2), nat(3)); } }
+]; })();
+
+// ---- The evaluator: the spec's rules as generators. Every yield is one step on the screen.
+
+var depth = 0;
+
+function st(rule, msg, focus) { return { rule: rule, msg: msg, focus: focus, depth: depth }; }
+
+function arity(v) {
+  if (v.t === "app") { return arity(v.f) - 1n; }
+  if (v.t === "pin") {
+    if (v.v.t === "nat") { var n = v.v.n; return n === 0n ? 1n : n === 1n ? 3n : n === 2n ? 1n : n === 3n ? 6n : 1n; }
+    return arity(v.v);
+  }
+  if (v.t === "law") { return v.a; }
+  if (v.t === "nat") { return 0n; }
+  throw new Diverge("the arity of a black hole");
+}
+
+function arityRule(v) {
+  if (v.t === "app") { return "Aapp"; }
+  if (v.t === "pin") { return v.v.t === "nat" ? "Aprim" : "Apin"; }
+  return v.t === "law" ? "Alaw" : "Anat";
+}
+
+function S_(o) {
+  if (o.t === "app") {
+    if (o.f.t === "app") { var g = S_(o.f); return g === o.f ? o : app(g, o.x); }
+    if (o.f.t === "pin") {
+      var p = o.f.v;
+      if (p.t === "law" || p.t === "nat") { return o; }
+      return S_(app(p, o.x));
+    }
+  }
+  return o;
+}
+
+function* E(o) {
+  if (o.t === "hole") { throw new Diverge("evaluating a black hole (a value that needs itself)"); }
+  if (o.t !== "app") { return o; }
+  depth++;
+  yield st("E", "Evaluate this application. First the head.", o);
+  yield* E(o.f);
+  var a = arity(o.f);
+  if (a !== 1n) {
+    yield st(arityRule(o.f), a > 1n ? "The head wants " + a + " more arguments, so this is a partial application. It stays as it is." : "The head takes no more arguments. This is data, and it stays as it is.", o);
+    depth--;
+    return o;
+  }
+  yield st("sat", "The head wants exactly one more argument, and has it: the call is saturated, so it runs.", o);
+  var s = S_(o);
+  if (s !== o) { set(o, s); yield st("S", "Unwrap the pin at the head of the spine.", o); }
+  var r = yield* X(o);
+  set(o, r);
+  yield st("X", "Overwrite this cell with the result, in place. Every other use of the cell sees it too.", o);
+  depth--;
+  yield* E(o);
+  return o;
+}
+
+function* N(o) {
+  yield* E(o);
+  return o.t === "nat" ? o.n : 0n;
+}
+
+function* F(o) {
+  yield* E(o);
+  if (o.t === "app") { yield* F(o.f); yield* F(o.x); }
+  return o;
+}
+
+function spine(e) {
+  var args = [];
+  var h = e;
+  while (h.t === "app") { args.unshift(h.x); h = h.f; }
+  return { head: h, args: args };
+}
+
+function* X(e) {
+  var sp = spine(e);
+  var h = sp.head;
+  var args = sp.args;
+  while (h.t === "pin") {
+    if (h.v.t !== "nat") { yield st("Xpin", "The head is a pin: look inside it.", e); }
+    h = h.v;
+  }
+  if (h.t === "nat") {
+    var op = h.n;
+    if (op === 0n) {
+      yield st("X0", "Primitive 0 makes a pin: normalize the argument and seal it.", e);
+      var v = yield* F(args[0]);
+      return pin(v);
+    }
+    if (op === 1n) {
+      yield st("X1", "Primitive 1 makes a law from a name, an arity and a body.", e);
+      var nm = yield* N(args[0]);
+      var a = yield* N(args[1]);
+      var b = yield* F(args[2]);
+      if (a === 0n) { throw new Diverge("a law with zero arguments"); }
+      return mk("law", { nm: nm, a: a, b: b });
+    }
+    if (op === 2n) {
+      yield st("X2", "Primitive 2 is Inc: evaluate the argument to a number and add one.", e);
+      var n = yield* N(args[0]);
+      return nat(n + 1n);
+    }
+    if (op === 3n) {
+      yield st("X3", "Primitive 3 is Case: evaluate the last argument and branch on what kind of value it is.", e);
+      var x = yield* E(args[5]);
+      if (x.t === "pin") { yield st("C0", "It is a pin.", e); return app(args[0], x.v); }
+      if (x.t === "law") { yield st("C1", "It is a law.", e); return apps(args[1], nat(x.nm), nat(x.a), x.b); }
+      if (x.t === "app") { yield st("C2", "It is an application.", e); return apps(args[2], x.f, x.x); }
+      if (x.t === "nat" && x.n === 0n) { yield st("C3", "It is the number 0: take the zero branch.", e); return args[3]; }
+      if (x.t === "nat") { yield st("C4", "It is a number above 0: call the last branch with one less (" + (x.n - 1n) + ").", e); return app(args[4], nat(x.n - 1n)); }
+      throw new Diverge("Case on a black hole");
+    }
+    throw new Diverge("a call of primitive " + op + ": there are only four (0 to 3)");
+  }
+  if (h.t === "law") { return yield* runLaw(sp.head, h, args, e); }
+  throw new Diverge("calling a black hole");
+}
+
+function isLet(b) { return b.t === "app" && b.f.t === "app" && b.f.f.t === "nat" && b.f.f.n === 1n; }
+
+function* runLaw(self, L, args, e) {
+  var env = [self].concat(args);
+  var b = L.b;
+  var lets = [];
+  while (isLet(b)) { lets.push(b.f.x); b = b.x; }
+  var holes = lets.map(function () { return hole(); });
+  env = env.concat(holes);
+  var n = BigInt(env.length - 1);
+  var name = natStr(L.nm) || String(L.nm);
+  yield st("Xlaw", "The head is a law (" + name + "). Its arguments are refs 1 to " + args.length + "; ref 0 is the law itself.", e);
+  if (lets.length) { yield st("B", "Its body starts with " + lets.length + " let" + (lets.length > 1 ? "s" : "") + ": make an empty cell <> for each.", e); }
+  var R = function (x) {
+    if (x.t === "nat") { return x.n <= n ? env[Number(x.n)] : x; }
+    if (x.t === "app" && x.f.t === "app" && x.f.f.t === "nat" && x.f.f.n === 0n) { return app(R(x.f.x), R(x.x)); }
+    if (x.t === "app" && x.f.t === "nat" && x.f.n === 0n) { return x.x; }
+    return x;
+  };
+  for (var i = 0; i < lets.length; i++) {
+    set(holes[i], R(lets[i]));
+    yield st("L", "Fill let " + (args.length + 1 + i) + " with its expression, built but not evaluated.", e);
+  }
+  var out = R(b);
+  yield st("R", "Build the body: each number up to " + n + " is a ref to an argument or a let; (0 f x) builds an application.", e);
+  return out;
+}
+
+// ---- Running a whole example to a trace of snapshots.
+
+var MAXSTEPS = 20000;
+
+function run(ex) {
+  NEXT = 0;
+  depth = 0;
+  var S = stdlib();
+  var root = ex.make(S);
+  var trace = [];
+  var err = null;
+  var shot = function (s) { trace.push({ rule: s.rule, msg: s.msg, depth: s.depth, names: render(root, s.focus, true), raw: render(root, s.focus, false) }); };
+  shot({ rule: "F", msg: "Start: normalize the whole expression (F).", focus: null, depth: 0 });
+  try {
+    var g = F(root);
+    while (true) {
+      var r = g.next();
+      if (r.done) { break; }
+      shot(r.value);
+      if (trace.length > MAXSTEPS) { err = "stopped after " + MAXSTEPS + " steps"; break; }
+    }
+  } catch (x) {
+    if (x instanceof Diverge) { err = "diverges: " + x.msg; } else { throw x; }
+  }
+  shot({ rule: "done", msg: err ? "Stopped: " + err : "Done. This is the normal form.", focus: null, depth: 0 });
+  var val = root.t === "nat" ? root.n : null;
+  return { trace: trace, value: val, err: err };
+}
+
+// ---- Rendering a value as text with spans. In the names view a known pin or law shows as its name.
+
+function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+function render(root, focus, names) {
+  var counts = new Map();
+  var count = function (o, d) {
+    if (d > 60) { return; }
+    counts.set(o, (counts.get(o) || 0) + 1);
+    if (counts.get(o) > 1) { return; }
+    if (o.t === "app") { count(o.f, d + 1); count(o.x, d + 1); }
+    if (!names && o.t === "pin") { count(o.v, d + 1); }
+    if (!names && o.t === "law") { count(o.b, d + 1); }
+  };
+  count(root, 0);
+  var budget = 6000;
+  var go = function (o, d, inner) {
+    if (budget <= 0) { return "..."; }
+    if (d > 60) { return "..."; }
+    var s;
+    if (names && LABELS.has(o)) { s = "<span class=nm>" + esc(LABELS.get(o)) + "</span>"; }
+    else if (o.t === "nat") { s = "<span class=n>" + o.n + "</span>"; }
+    else if (o.t === "hole") { s = "<span class=bh>&lt;&gt;</span>"; }
+    else if (o.t === "pin") { s = "&lt;" + go(o.v, d + 1, false) + "&gt;"; }
+    else if (o.t === "law") {
+      var nm = natStr(o.nm);
+      s = "<span class=lw>" + LB + (nm ? "%" + esc(nm) : String(o.nm)) + " " + o.a + " " + go(o.b, d + 1, false) + RB + "</span>";
+    } else {
+      var sp = spine(o);
+      var parts = [go(sp.head, d + 1, true)].concat(sp.args.map(function (x) { return go(x, d + 1, false); }));
+      s = parts.join(" ");
+      if (o !== root) { s = "(" + s + ")"; }
+    }
+    budget -= 20;
+    if ((counts.get(o) || 0) > 1 && (o.t === "app" || o.t === "hole")) { s = "<span class=sh title='one shared cell'><sup>#" + o.id + "</sup>" + s + "</span>"; }
+    if (o === focus) { s = "<span class=fo>" + s + "</span>"; }
+    return s;
+  };
+  return go(root, 0, true);
+}
+
+// ---- The page.
+
+var CSS = [
+":root" + LB + "--bg:#fbfaf7;--fg:#1d1d1b;--dim:#6b6b66;--box:#fff;--line:#ddd8cc;--lit:#ffe58a;--lit2:#fff3c4;--fo:#ffd36b;--acc:#1a5fb4;--nat:#0b6e4f;--nm:#7a3e9d;--bh:#c0392b" + RB,
+"@media (prefers-color-scheme: dark)" + LB + ":root" + LB + "--bg:#16171a;--fg:#e8e6e1;--dim:#9a988f;--box:#1f2125;--line:#34363b;--lit:#6b5a12;--lit2:#3a3420;--fo:#7a5d00;--acc:#7fb0ff;--nat:#6fd3a8;--nm:#d3a6f0;--bh:#ff7b6b" + RB + RB,
+"body" + LB + "margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif" + RB,
+"main" + LB + "max-width:76rem;margin:0 auto;padding:12px 16px 40px" + RB,
+"h1" + LB + "font-size:1.35rem;margin:.2rem 0" + RB,
+".dim" + LB + "color:var(--dim)" + RB,
+".mono,pre,#ex" + LB + "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" + RB,
+"select,button" + LB + "font:inherit;padding:.45rem .8rem;border-radius:.5rem;border:1px solid var(--line);background:var(--box);color:var(--fg);min-height:44px" + RB,
+"button:active" + LB + "transform:translateY(1px)" + RB,
+".home" + LB + "font-family:monospace;text-decoration:none;color:#a0d5fc;border-bottom:2px solid transparent" + RB,
+".home:hover" + LB + "color:#c9c9c9;border-bottom-color:#c9c9c9" + RB,
+".row" + LB + "display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;margin:.5rem 0" + RB,
+"#slider" + LB + "width:100%" + RB,
+".grid" + LB + "display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:1rem" + RB,
+"@media (max-width:900px)" + LB + ".grid" + LB + "grid-template-columns:1fr" + RB + RB,
+".box" + LB + "background:var(--box);border:1px solid var(--line);border-radius:.6rem;padding:.7rem .8rem;min-width:0" + RB,
+"#ex" + LB + "font-size:1.05rem;line-height:1.9;word-break:break-word" + RB,
+"#msg" + LB + "font-weight:600;min-height:3em" + RB,
+"pre" + LB + "margin:0;font-size:.78rem;line-height:1.35;overflow-x:auto" + RB,
+"pre span.l" + LB + "border-radius:.2rem" + RB,
+"pre span.on" + LB + "background:var(--lit);outline:1px solid var(--lit)" + RB,
+".fo" + LB + "background:var(--fo);border-radius:.25rem;padding:0 .1rem" + RB,
+".n" + LB + "color:var(--nat)" + RB,
+".nm" + LB + "color:var(--nm);font-weight:600" + RB,
+".bh" + LB + "color:var(--bh);font-weight:700" + RB,
+".lw" + LB + "color:var(--nm)" + RB,
+".sh sup" + LB + "color:var(--acc);font-size:.65em;margin-right:.1em" + RB,
+".res" + LB + "padding:.3rem .6rem;border-radius:.4rem;display:inline-block" + RB,
+".ok" + LB + "background:#d6f5e3;color:#0b5132" + RB,
+".bad" + LB + "background:#fde2e1;color:#7a1712" + RB,
+"#lit" + LB + "margin:.3rem 0;padding:.2rem .4rem;background:var(--lit2);border-radius:.3rem;white-space:pre-wrap" + RB,
+"#lit:empty" + LB + "display:none" + RB,
+"#depth" + LB + "height:6px;background:var(--acc);border-radius:3px;transition:width .1s;max-width:100%" + RB,
+"label" + LB + "display:inline-flex;gap:.3rem;align-items:center;min-height:44px" + RB
+].join(" ");
+
+var state = { ex: 0, res: null, i: 0, names: true };
+
+function el(id) { return document.getElementById(id); }
+
+function build() {
+  var st0 = document.createElement("style");
+  st0.textContent = CSS;
+  document.head.appendChild(st0);
+  var opts = EXAMPLES.map(function (e, i) { return "<option value=" + i + ">" + esc(e.title) + "</option>"; }).join("");
+  document.body.innerHTML = "<main>" +
+    "<div class=row><a class=home href='/'>home</a></div>" +
+    "<h1>PLAN, one rule at a time</h1>" +
+    "<p class=dim>Every step below is one rule of PLAN's whole specification (on the right, 42 lines). The ship runs on these rules and nothing else.</p>" +
+    "<div class=row><select id=pick aria-label=Example>" + opts + "</select>" +
+    "<label><input type=checkbox id=names checked> names</label></div>" +
+    "<p id=blurb class=dim></p>" +
+    "<div class=row>" +
+    "<button id=b0>|&lt;</button><button id=bback>&lt; Back</button><button id=bnext>Step &gt;</button>" +
+    "<button id=bover>Over</button><button id=bout>Out</button><button id=bend>&gt;|</button>" +
+    "</div>" +
+    "<input id=slider type=range min=0 value=0 aria-label=Step>" +
+    "<div class=row><span id=count class=dim></span><span id=result></span></div>" +
+    "<div class=grid>" +
+    "<div><div class=box><div id=msg></div><pre id=lit></pre><div id=depth></div></div>" +
+    "<div class=box style='margin-top:.6rem'><div id=ex></div></div>" +
+    "<p class=dim>Yellow is where the rule applies. <span class=bh>&lt;&gt;</span> is an empty cell (a black hole), filled later. " +
+    "A small <span style='color:var(--acc)'>#n</span> marks one cell used in more than one place. " +
+    "Over skips the details of the current step, Out finishes it. Untick names to see the raw PLAN.</p></div>" +
+    "<div class=box><pre id=spec></pre></div>" +
+    "</div>" +
+    "<p class=dim>A first version: the laws (Add, Times, NatCase, ...) are copied by hand from the ship's standard library, " +
+    "and the stepping runs in this page's JavaScript. The ship's own interpreter (plan-di-c) gives the same answers: " +
+    "the green box says so. Note: the spec says X[4,...] for Case; the arity line A[&lt;n:@&gt;] and plan-di-c both make Case primitive 3.</p>" +
+    "</main>";
+  var pre = el("spec");
+  pre.innerHTML = SPEC.map(function (line, k) {
+    var bar = line.indexOf("|", 30);
+    if (bar === 35) {
+      return "<span class=l id=s" + (k + 1) + "-0>" + esc(line.slice(0, 35)) + "</span>|<span class=l id=s" + (k + 1) + "-1>" + esc(line.slice(36)) + "</span>";
+    }
+    return "<span class=l id=s" + (k + 1) + "-0>" + esc(line) + "</span>";
+  }).join(String.fromCharCode(10));
+  el("pick").onchange = function () { load(Number(el("pick").value)); };
+  el("names").onchange = function () { state.names = el("names").checked; show(); };
+  el("b0").onclick = function () { go(0); };
+  el("bend").onclick = function () { go(state.res.trace.length - 1); };
+  el("bback").onclick = function () { go(state.i - 1); };
+  el("bnext").onclick = function () { go(state.i + 1); };
+  el("bover").onclick = function () { go(seek(function (s, d) { return s.depth <= d; })); };
+  el("bout").onclick = function () { go(seek(function (s, d) { return s.depth < d; })); };
+  el("slider").oninput = function () { go(Number(el("slider").value)); };
+  document.addEventListener("keydown", function (ev) {
+    if (ev.target.tagName === "SELECT") { return; }
+    if (ev.key === "ArrowRight") { go(state.i + 1); ev.preventDefault(); }
+    if (ev.key === "ArrowLeft") { go(state.i - 1); ev.preventDefault(); }
+    if (ev.key === "ArrowDown") { el("bover").click(); ev.preventDefault(); }
+    if (ev.key === "ArrowUp") { el("bout").click(); ev.preventDefault(); }
+  });
+  load(0);
+}
+
+function seek(test) {
+  var t = state.res.trace;
+  var d = t[state.i].depth;
+  for (var j = state.i + 1; j < t.length; j++) { if (test(t[j], d)) { return j; } }
+  return t.length - 1;
+}
+
+function load(k) {
+  state.ex = k;
+  state.res = run(EXAMPLES[k]);
+  state.i = 0;
+  var ex = EXAMPLES[k];
+  el("blurb").textContent = ex.blurb;
+  el("slider").max = state.res.trace.length - 1;
+  var r = state.res;
+  var good = r.value === ex.want;
+  el("result").innerHTML = "<span class='res " + (good ? "ok" : "bad") + "'>" + esc(ex.sire) + " = " + (r.value === null ? "?" : r.value) +
+    (good ? ", as plan-di-c says" : "; plan-di-c says " + ex.want) + "</span>";
+  show();
+}
+
+function go(i) {
+  var n = state.res.trace.length;
+  state.i = Math.max(0, Math.min(n - 1, i));
+  show();
+}
+
+function show() {
+  var t = state.res.trace;
+  var s = t[state.i];
+  el("ex").innerHTML = state.names ? s.names : s.raw;
+  el("msg").textContent = s.msg;
+  el("count").textContent = "step " + state.i + " of " + (t.length - 1);
+  el("slider").value = state.i;
+  el("depth").style.width = Math.min(100, s.depth * 4) + "%";
+  var on = document.querySelectorAll("pre span.on");
+  for (var k = 0; k < on.length; k++) { on[k].classList.remove("on"); }
+  var first = null;
+  var lit = [];
+  (RULES[s.rule] || []).forEach(function (p) {
+    var e = el("s" + p[0] + "-" + p[1]);
+    if (e) { e.classList.add("on"); first = first || e; lit.push(e.textContent.trim()); }
+  });
+  el("lit").textContent = lit.join(String.fromCharCode(10));
+  if (first && window.innerWidth > 900) { first.scrollIntoView({ block: "nearest" }); }
+}
+
+if (typeof document !== "undefined") { build(); }
+
+if (typeof module !== "undefined") { module.exports = { EXAMPLES: EXAMPLES, run: run, SPEC: SPEC }; }
+
+</script></body></html>
